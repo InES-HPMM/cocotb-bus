@@ -552,11 +552,11 @@ class AXI4LiteMaster(AXI4Master):
 
 
 class AXI4Slave(BusDriver):
-    '''
+    """
     AXI4 Slave
 
     Monitors an internal memory and handles read and write requests.
-    '''
+    """
     _signals = [
         "ARREADY", "ARVALID", "ARADDR",             # Read address channel
         "ARLEN",   "ARSIZE",  "ARBURST", "ARPROT",
@@ -706,3 +706,112 @@ class AXI4Slave(BusDriver):
                 self.bus.RLAST.value = 0
                 if burst_count == 0:
                     break
+
+
+class AXI4LiteSlave(AXI4Slave):
+    """
+    AXI4-Lite Slave
+
+    Monitors an internal memory and handles read and write requests. Does not
+    support AXI ID reflection nor conversion.
+    """
+    _signals = ["AWVALID", "AWREADY", "AWADDR", "AWPROT",  # Write address channel
+                "WVALID", "WREADY", "WDATA", "WSTRB",      # Write data channel
+                "BVALID", "BREADY",                        # Write response channel
+                "ARVALID", "ARREADY", "ARADDR",            # Read address channel
+                "RVALID", "RREADY", "RDATA", "RRESP"]      # Read data channel
+
+    _optional_signals = ["BRESP",   # Write response channel
+                         "ARPROT",  # Read address channel
+                         "RRESP"]   # Read data channel
+
+    def __init__(self, entity: SimHandleBase, name: str, clock: SimHandleBase,
+                 memory: array.array, callback=None, event=None,
+                 big_endian: Optional[bool] = False, **kwargs: Any):
+
+        BusDriver.__init__(self, entity, name, clock, **kwargs)
+        self.clock = clock
+
+        self.big_endian = big_endian
+        self.bus.AWREADY.setimmediatevalue(1)
+        self.bus.ARREADY.setimmediatevalue(1)
+        self.bus.RVALID.setimmediatevalue(0)
+        self.bus.RLAST.setimmediatevalue(0)
+        self._memory = memory
+
+        self.write_address_busy = Lock("%s_wabusy" % name)
+        self.read_address_busy = Lock("%s_rabusy" % name)
+        self.write_data_busy = Lock("%s_wbusy" % name)
+
+        cocotb.fork(self._read_data())
+        cocotb.fork(self._write_data())
+
+    async def _write_data(self) -> None:
+        clock_re = RisingEdge(self.clock)
+
+        while True:
+            while True:
+                self.bus.WREADY.value = 0
+                await ReadOnly()
+                if self.bus.AWVALID.value:
+                    self.bus.WREADY.value = 1
+                    break
+                await clock_re
+
+            await ReadOnly()
+            _awaddr = int(self.bus.AWADDR)
+            _awlen = 0
+            _awsize = int(self.bus.AWSIZE)
+            _awprot = int(self.bus.AWPROT)
+
+            if __debug__:
+                self.log.debug(
+                    "AWADDR  %d\n" % _awaddr +
+                    "AWLEN   %d\n" % _awlen +
+                    "AWSIZE  %d\n" % _awsize +
+                    "AWPROT %d\n" % _awprot)
+
+            await clock_re
+
+            while True:
+                if self.bus.WVALID.value:
+                    word = self.bus.WDATA.value
+                    word.big_endian = self.big_endian
+                    _st = _awaddr
+                    _end = _awaddr + len(self.bus.WDATA) // 8
+                    self._memory[_st:_end] = array.array('B', word.buff)
+                await clock_re
+
+    async def _read_data(self) -> None:
+        clock_re = RisingEdge(self.clock)
+
+        while True:
+            while True:
+                await ReadOnly()
+                if self.bus.ARVALID.value:
+                    break
+                await clock_re
+
+            await ReadOnly()
+            _araddr = int(self.bus.ARADDR)
+            _arprot = int(self.bus.ARPROT)
+
+            word = BinaryValue(n_bits=len(self.bus.WDATA),
+                               bigEndian=self.big_endian)
+
+            if __debug__:
+                self.log.debug(
+                    "ARADDR  %d\n" % _araddr +
+                    "ARPROT %d\n" % _arprot)
+
+            await clock_re
+
+            while True:
+                self.bus.RVALID.value = 1
+                await ReadOnly()
+                if self.bus.RREADY.value:
+                    _st = _araddr
+                    _end = _araddr + len(self.bus.WDATA) // 8
+                    word.buff = self._memory[_st:_end].tobytes()
+                    self.bus.RDATA.value = word
+                await clock_re
