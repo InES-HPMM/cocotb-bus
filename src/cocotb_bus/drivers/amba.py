@@ -552,6 +552,180 @@ class AXI4LiteMaster(AXI4Master):
         return ret[0]
 
 
+class AXI4StreamMaster(BusDriver):
+    """AXI4-Stream Master"""
+
+    _signals = ["TVALID"]
+
+    _optional_signals = [
+        "TREADY", "TDATA", "TSTRB", "TKEEP", "TLAST", "TID", "TDEST", "TUSER"
+    ]
+
+    def __init__(self, entity: SimHandleBase, name: str, clock: SimHandleBase,
+                 **kwargs: Any):
+        BusDriver.__init__(self, entity, name, clock, **kwargs)
+
+        # Drive TVALID (setimmediatevalue to avoid x asserts)
+        self.bus.TVALID.setimmediatevalue(0)
+
+        # Set the default value (0) for the unsupported signals, which
+        # translate to:
+        #  * Transaction source IDs to 0
+        #  * Transaction destination IDs to 0
+        unsupported_signals = ["TID", "TDEST"]
+        for signal in unsupported_signals:
+            try:
+                getattr(self.bus, signal).setimmediatevalue(0)
+            except AttributeError:
+                pass
+
+        # Mutex for each channel to prevent contention
+        self.tdata_busy = Lock(name + "_wbusy")
+
+    def _convert_to_stream(
+        self, data: Sequence[int], keep_strb_enabled: bool
+    ) -> (Sequence[int], Optional[Sequence[int]], Optional[Sequence[int]]):
+        """Convert a data sequence to a data stream.
+
+        Convert a data sequence to a data stream. Take also TKEEP and TSTRB into
+        account.
+
+        Args:
+            data: The data value(s) to write.
+            keep_strb_enabled: TKEEP and TSTRB signals enabled.
+        Returns: The output stream.
+        """
+        tdata_bytes = len(self.bus.TDATA) // 8
+        data_iterator = iter(data)
+
+        if keep_strb_enabled:
+            tdata_stream = []
+            tkeep_stream = []
+            tstrb_stream = []
+            offset_counter = 0
+            while data_iterator is not None:
+                tdata = 0
+                tkeep = 0
+                tstrb = 0
+                for byte_shift in range(tdata_bytes):
+                    try:
+                        # If a value exists add it to the stream if it is
+                        # non-zero. If zero increase the offset_counter and
+                        # neglect the value. The offset will be added to the
+                        # stream if either the offset counter reaches 255, or a
+                        # non-zero value follows.
+                        value = next(data_iterator)
+                        tkeep |= (1 << byte_shift)
+                        if value != 0:
+                            if offset_counter > 0:
+                                tdata |= (offset_counter << (byte_shift * 8))
+                                tkeep |= (1 << byte_shift)
+                                tstrb |= (0 << byte_shift)
+                                offset_counter = 0
+                            tdata |= (value << (byte_shift * 8))
+                            tstrb |= (1 << byte_shift)
+                        else:
+                            if offset_counter < 255:
+                                offset_counter += 1
+                            else:
+                                tdata |= (offset_counter << (byte_shift * 8))
+                                tkeep |= (1 << byte_shift)
+                                tstrb |= (0 << byte_shift)
+                                offset_counter = 0
+                                tdata |= (value << (byte_shift * 8))
+                                tkeep |= (1 << byte_shift)
+                                tstrb |= (1 << byte_shift)
+                    except StopIteration:
+                        # If no value exists fill up the remaining bus width
+                        # with Null bytes
+                        tdata |= (0 << (byte_shift * 8))
+                        tkeep |= (0 << byte_shift)
+                        tstrb |= (0 << byte_shift)
+                tdata_stream.append(tdata)
+                tkeep_stream.append(tkeep)
+                tstrb_stream.append(tstrb)
+
+            return tdata_stream, tkeep_stream, tstrb_stream
+        else:
+            assert len(data) % tdata_bytes == 0, \
+                "Data has to divisible by TDATA_WIDTH!"
+            tdata_stream = []
+            while data_iterator is not None:
+                tdata = 0
+                for byte_shift in range(tdata_bytes):
+                    tdata |= (data_iterator << (byte_shift * 8))
+                    next(data_iterator)
+                tdata_stream.append(tdata)
+            return tdata_stream
+
+    @cocotb.coroutine
+    async def write(self, data: Union[int, Sequence[int]],
+                    data_latency: int = 0, sync: bool = True) -> None:
+        """Write stream data
+
+        Args:
+            data: The data value(s) to write.
+            data_latency: Delay before setting the data value (in clock
+                cycles).
+                Default is no delay.
+            sync: Wait for rising edge on clock initially.
+                Defaults to True.
+        """
+
+        if hasattr(self.bus, "TDATA"):
+            tdata_stream = []
+            tkeep_stream = []
+            tstrb_stream = []
+
+            if hasattr(self.bus, "TKEEP") and hasattr(self.bus, "TSTRB"):
+                tdata_stream, tkeep_stream, tstrb_stream = self._convert_to_stream(
+                    data, True)
+
+                if __debug__:
+                    self.log.debug(
+                        "DATA  %d\n" % data +
+                        "TDATA  %d\n" % tdata_stream +
+                        "TKEEP   %d\n" % tkeep_stream +
+                        "TSTRB  %d\n" % tstrb_stream)
+            else:
+                tdata_stream = self._convert_to_stream(data, False)
+
+                if __debug__:
+                    self.log.debug(
+                        "DATA  %d\n" % data +
+                        "TDATA  %d\n" % tdata_stream)
+
+        async with self.tdata_busy:
+            if sync:
+                await RisingEdge(self.clock)
+
+            for beat_num in enumerate(tdata_stream):
+                await ClockCycles(self.clock, data_latency)
+
+                self.bus.TVALID.value = 1
+                if hasattr(self.bus, "TDATA"):
+                    self.bus.TDATA.value = tdata_stream[beat_num]
+                    if hasattr(self.bus, "TKEEP") and hasattr(
+                            self.bus, "TSTRB"):
+                        self.bus.TKEEP.value = tkeep_stream[beat_num]
+                        self.bus.TSTRB.value = tstrb_stream[beat_num]
+
+                if hasattr(self.bus, "TLAST"):
+                    if beat_num == len(data) - 1:
+                        self.bus.TLAST.value = 1
+                    else:
+                        self.bus.TLAST.value = 0
+
+                while True:
+                    await RisingEdge(self.clock)
+                    if not hasattr(self.bus,
+                                   "TREADY") or self.bus.TREADY.value == 1:
+                        break
+
+                if beat_num == len(data) - 1:
+                    self.bus.TVALID.value = 0
+
+
 class AXI4Slave(BusDriver):
     """
     AXI4 Slave
@@ -804,3 +978,125 @@ class AXI4LiteSlave(AXI4Slave):
                     word.buff = self._memory[_st:_end].tobytes()
                     self.bus.RDATA.value = word
                 await clock_re
+
+
+class AXI4StreamSlave(BusDriver):
+    """AXI4-Stream Slave"""
+
+    _signals = ["TVALID"]
+
+    _optional_signals = [
+        "TREADY", "TDATA", "TSTRB", "TKEEP", "TLAST", "TID", "TDEST", "TUSER"
+    ]
+
+    def __init__(self, entity: SimHandleBase, name: str, clock: SimHandleBase,
+                 **kwargs: Any):
+        BusDriver.__init__(self, entity, name, clock, **kwargs)
+
+    def _convert_from_stream(self, tdata_stream: Sequence[int],
+                             tkeep_stream: Optional[Sequence[int]],
+                             tstrb_stream: Optional[Sequence[int]],
+                             keep_strb_enabled: bool) -> Sequence[int]:
+        """Convert a stream back to the full data sequence.
+
+        Convert a stream back to the full data sequence. Take also TKEEP and
+        TSTRB into account.
+
+        Args:
+            tdata_stream: The data stream.
+            tkeep_stream: The keep flag stream.
+            tstrb_stream: The strobe flag stream.
+            keep_strb_enabled: TKEEP and TSTRB signals enabled.
+        Returns: The reconstructed data sequence
+        Raises:
+            ValueError: If any of the input parameters is invalid.
+        """
+        byte_mask = 0xFF
+        bit_mask = 0x1
+        tdata_bytes = len(self.bus.TDATA) // 8
+
+        data = []
+        if not keep_strb_enabled:
+            for input in tdata_stream:
+                for byte_shift in range(tdata_bytes):
+                    data.append(input >> (byte_shift * 8) & byte_mask)
+        else:
+            for input, keep, strb in zip(tdata_stream, tkeep_stream, tstrb_stream):
+                for byte_shift in range(tdata_bytes):
+                    keep_bit = (keep >> byte_shift) & bit_mask
+                    strb_bit = (keep >> byte_shift) & bit_mask
+                    input_byte = input >> (byte_shift * 8) & byte_mask
+                    # Data byte
+                    if keep_bit == 1 and strb_bit == 1:
+                        data.append(input_byte)
+                    # Position byte
+                    elif keep_bit == 1 and strb_bit == 0:
+                        for i in range(input_byte):
+                            data.append(0)
+                    # Null byte
+                    elif keep_bit == 0 and strb_bit == 0:
+                        pass
+                    # Reserved
+                    else:
+                        raise ValueError
+
+        return data
+
+    @cocotb.coroutine
+    async def read(self,
+                   data: Union[int, Sequence[int]],
+                   data_latency: int = 0,
+                   sync: bool = True) -> Optional[Sequence[int]]:
+        """Write stream data.
+
+        Args:
+            data: The data value(s) to write.
+            data_latency: Delay before setting the data value (in clock
+                cycles).
+                Default is no delay.
+            sync: Wait for rising edge on clock initially.
+                Defaults to True.
+        Returns: The read data stream.
+        """
+        tdata_stream = []
+        tkeep_stream = []
+        tstrb_stream = []
+
+        async with self.tdata_busy:
+            if sync:
+                await RisingEdge(self.clock)
+
+            if hasattr(self.bus, "TREADY"):
+                self.bus.TREADY.value = 1
+
+            if not hasattr(self.bus, "TLAST"):
+                if self.bus.TVALID.value == 1:
+                    if hasattr(self.bus, "TDATA"):
+                        tdata_stream.append(self.bus.TDATA.value)
+                    if hasattr(self.bus, "TKEEP") and hasattr(
+                            self.bus, "TSTRB"):
+                        tkeep_stream.append(self.bus.TKEEP.value)
+                        tstrb_stream.append(self.bus.TSTRB.value)
+            else:
+                while self.bus.TLAST.value == 0:
+                    if hasattr(self.bus, "TDATA"):
+                        tdata_stream.append(self.bus.TDATA.value)
+                    if hasattr(self.bus, "TKEEP") and hasattr(
+                            self.bus, "TSTRB"):
+                        tkeep_stream.append(self.bus.TKEEP.value)
+                        tstrb_stream.append(self.bus.TSTRB.value)
+
+                    while True:
+                        await RisingEdge(self.clock)
+                        if not hasattr(self.bus,
+                                       "TREADY") or self.bus.TREADY.value == 1:
+                            break
+
+        if hasattr(self.bus, "TDATA"):
+            if hasattr(self.bus, "TKEEP") and hasattr(self.bus, "TSTRB"):
+                return self._convert_from_stream(tdata_stream, tkeep_stream,
+                                                 tstrb_stream, True)
+            else:
+                return self._convert_from_stream(tdata_stream, True)
+        else:
+            return None
